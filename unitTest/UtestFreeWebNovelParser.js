@@ -35,7 +35,7 @@ QUnit.test("findCoverImageUrl", function (assert) {
 
 QUnit.test("getChapterUrls first page", async function (assert) {
     let dom = new DOMParser().parseFromString(FreeWebNovelNovelSample, "text/html");
-    let parser = new FreeWebNovelParser();
+    let parser = new FreeWebNovelComParser();
     let base = dom.createElement("base");
     base.href = "https://freewebnovel.com/novel/all-jobs-and-classes-i-just-wanted-one-skill-not-them-all";
     dom.head.appendChild(base);
@@ -117,6 +117,80 @@ QUnit.test("getChapterUrls rejects failed or invalid paginated TOC pages", async
         assert.ok(false, "an unsuccessful TOC response must reject");
     } catch (error) {
         assert.ok(/Invalid FreeWebNovel TOC response/.test(error.message), "the unsuccessful TOC response is rejected");
+    } finally {
+        HttpClient.fetchJson = originalFetchJson;
+    }
+});
+
+QUnit.test("getChapterUrls from a FreeWebNovel chapter includes it and every following chapter", async function (assert) {
+    let dom = new DOMParser().parseFromString(FreeWebNovelChapterTwoSample, "text/html");
+    let parser = new FreeWebNovelComParser();
+    let requestedUrls = [];
+    let originalWrapFetch = HttpClient.wrapFetch;
+    HttpClient.wrapFetch = async function(url) {
+        requestedUrls.push(url);
+        let tocDom = new DOMParser().parseFromString(FreeWebNovelChapterTocSample, "text/html");
+        return {responseXML: tocDom};
+    };
+
+    let progressUpdates = [];
+    let chapterUrlsUI = {
+        showTocProgress: function(chapters) {
+            progressUpdates.push(chapters);
+        }
+    };
+
+    try {
+        let chapters = await parser.getChapterUrls(dom, chapterUrlsUI);
+        assert.deepEqual(chapters.map(chapter => chapter.title), ["Chapter 2", "Chapter 3"]);
+        assert.deepEqual(chapters.map(chapter => chapter.sourceUrl), [
+            "https://freewebnovel.com/novel/example/chapter-2",
+            "https://freewebnovel.com/novel/example/chapter-3"
+        ]);
+        assert.deepEqual(requestedUrls, ["https://freewebnovel.com/novel/example"]);
+        assert.equal(progressUpdates.length, 1, "progress only includes the requested chapter range");
+    } finally {
+        HttpClient.wrapFetch = originalWrapFetch;
+    }
+});
+
+QUnit.test("getChapterUrls uses the desktop chapter-page TOC without fetching the novel page", async function (assert) {
+    let dom = new DOMParser().parseFromString(FreeWebNovelChapterTwoWithTocSample, "text/html");
+    let parser = new FreeWebNovelComParser();
+    let originalWrapFetch = HttpClient.wrapFetch;
+    HttpClient.wrapFetch = async function() {
+        assert.ok(false, "the embedded desktop TOC avoids a novel-page request");
+    };
+
+    try {
+        let chapters = await parser.getChapterUrls(dom, {showTocProgress: function() {}});
+        assert.deepEqual(chapters.map(chapter => chapter.title), ["Chapter 2", "Chapter 3"]);
+    } finally {
+        HttpClient.wrapFetch = originalWrapFetch;
+    }
+});
+
+QUnit.test("getChapterUrls from a later chapter skips earlier TOC pages", async function (assert) {
+    let dom = new DOMParser().parseFromString(FreeWebNovelChapterThreePaginatedSample, "text/html");
+    let parser = new FreeWebNovelComParser();
+    parser.rateLimitDelay = async function() {};
+    let requestedUrls = [];
+    let originalFetchJson = HttpClient.fetchJson;
+    HttpClient.fetchJson = async function(url) {
+        requestedUrls.push(url);
+        let html = url.endsWith("page=2")
+            ? FreeWebNovelChapterTocPageTwo
+            : FreeWebNovelChapterTocPageThree;
+        return {json: {code: 200, html: html}};
+    };
+
+    try {
+        let chapters = await parser.getChapterUrls(dom, {showTocProgress: function() {}});
+        assert.deepEqual(chapters.map(chapter => chapter.title), ["Chapter 3", "Chapter 4", "Chapter 5"]);
+        assert.deepEqual(requestedUrls, [
+            "https://freewebnovel.com/novel/example?ajax=chapters&page=2",
+            "https://freewebnovel.com/novel/example?ajax=chapters&page=3"
+        ]);
     } finally {
         HttpClient.fetchJson = originalFetchJson;
     }
@@ -236,6 +310,75 @@ let FreeWebNovelSecondTocPage = `
 <ul id="idData">
     <li><a href="/novel/example/chapter-2">Chapter 2</a></li>
     <li><a href="/novel/example/chapter-3">Chapter 3</a></li>
+</ul>
+`;
+
+let FreeWebNovelChapterTwoSample = `
+<!DOCTYPE html>
+<html>
+<head><base href="https://freewebnovel.com/novel/example/chapter-2"></head>
+<body>
+    <span class="chapter">Chapter 2</span>
+    <div id="article"><p>Chapter two text.</p></div>
+    <ul id="idData"></ul>
+</body>
+</html>
+`;
+
+let FreeWebNovelChapterTocSample = `
+<!DOCTYPE html>
+<html>
+<head><base href="https://freewebnovel.com/novel/example"></head>
+<body>
+    <ul id="idData">
+        <li><a href="/novel/example/chapter-1">Chapter 1</a></li>
+        <li><a href="/novel/example/chapter-2">Chapter 2</a></li>
+        <li><a href="/novel/example/chapter-3">Chapter 3</a></li>
+    </ul>
+</body>
+</html>
+`;
+
+let FreeWebNovelChapterTwoWithTocSample = `
+<!DOCTYPE html>
+<html>
+<head><base href="https://freewebnovel.com/novel/example/chapter-2"></head>
+<body>
+    <span class="chapter">Chapter 2</span>
+    <div id="article"><p>Chapter two text.</p></div>
+    <ul id="idData">
+        <li><a href="/novel/example/chapter-1">Chapter 1</a></li>
+        <li><a href="/novel/example/chapter-2">Chapter 2</a></li>
+        <li><a href="/novel/example/chapter-3">Chapter 3</a></li>
+    </ul>
+</body>
+</html>
+`;
+
+let FreeWebNovelChapterThreePaginatedSample = `
+<!DOCTYPE html>
+<html>
+<head><base href="https://freewebnovel.com/novel/example/chapter-3"></head>
+<body>
+    <select id="indexselect"><option>1</option><option>2</option><option>3</option></select>
+    <ul id="idData">
+        <li><a href="/novel/example/chapter-1">Chapter 1</a></li>
+        <li><a href="/novel/example/chapter-2">Chapter 2</a></li>
+    </ul>
+</body>
+</html>
+`;
+
+let FreeWebNovelChapterTocPageTwo = `
+<ul id="idData">
+    <li><a href="/novel/example/chapter-3">Chapter 3</a></li>
+    <li><a href="/novel/example/chapter-4">Chapter 4</a></li>
+</ul>
+`;
+
+let FreeWebNovelChapterTocPageThree = `
+<ul id="idData">
+    <li><a href="/novel/example/chapter-5">Chapter 5</a></li>
 </ul>
 `;
 

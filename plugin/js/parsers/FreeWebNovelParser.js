@@ -20,20 +20,7 @@ class FreeWebNovelParser extends Parser {
         let menu = dom.querySelector("ul#idData");
         let chapters = this.removeDuplicateChapterUrls(util.hyperlinksToChapterList(menu));
 
-        let totalPage = 1;
-        let indexSelect = dom.querySelector("#indexselect");
-        if (indexSelect) {
-            totalPage = indexSelect.querySelectorAll("option").length;
-        } else {
-            let scripts = [...dom.querySelectorAll("script")];
-            for (let script of scripts) {
-                let match = /totalPage:\s*(\d+)/.exec(script.textContent);
-                if (match) {
-                    totalPage = parseInt(match[1]);
-                    break;
-                }
-            }
-        }
+        let totalPage = this.getTotalTocPages(dom);
 
         if (totalPage > 1) {
             chapterUrlsUI.showTocProgress(chapters);
@@ -45,15 +32,7 @@ class FreeWebNovelParser extends Parser {
 
             for (let page = 2; page <= totalPage; ++page) {
                 await this.rateLimitDelay();
-                let url = `${baseNovelUrl}?ajax=chapters&page=${page}`;
-                let response = await HttpClient.fetchJson(url);
-                if (response?.json?.code !== 200 || typeof response.json.html !== "string") {
-                    throw new Error(`Invalid FreeWebNovel TOC response for page ${page}.`);
-                }
-
-                let parser = new DOMParser();
-                let tempDom = parser.parseFromString(response.json.html, "text/html");
-                util.setBaseTag(url, tempDom);
+                let tempDom = await this.fetchTocPage(baseNovelUrl, page);
                 let partialChapters = util.hyperlinksToChapterList(tempDom);
                 if (partialChapters.length === 0) {
                     throw new Error(`FreeWebNovel TOC page ${page} contains no chapters.`);
@@ -68,6 +47,33 @@ class FreeWebNovelParser extends Parser {
         }
 
         return chapters;
+    }
+
+    getTotalTocPages(dom) {
+        let indexSelect = dom.querySelector("#indexselect");
+        if (indexSelect) {
+            return indexSelect.querySelectorAll("option").length;
+        }
+
+        for (let script of dom.querySelectorAll("script")) {
+            let match = /totalPage:\s*(\d+)/.exec(script.textContent);
+            if (match) {
+                return parseInt(match[1]);
+            }
+        }
+        return 1;
+    }
+
+    async fetchTocPage(baseNovelUrl, page) {
+        let url = `${baseNovelUrl}?ajax=chapters&page=${page}`;
+        let response = await HttpClient.fetchJson(url);
+        if (response?.json?.code !== 200 || typeof response.json.html !== "string") {
+            throw new Error(`Invalid FreeWebNovel TOC response for page ${page}.`);
+        }
+
+        let tempDom = new DOMParser().parseFromString(response.json.html, "text/html");
+        util.setBaseTag(url, tempDom);
+        return tempDom;
     }
 
     removeDuplicateChapterUrls(chapters, existingChapters = []) {
@@ -275,6 +281,138 @@ class FreeWebNovelComParser extends FreeWebNovelParser {
     constructor() {
         super();
     }
+
+    async getChapterUrls(dom, chapterUrlsUI) {
+        let novelUrl = this.getNovelUrlFromChapterUrl(dom.baseURI);
+        if (novelUrl != null) {
+            // Some desktop chapter pages also contain #idData for reader UI,
+            // so identify chapter pages from their URL before checking the DOM.
+            return this.getChapterUrlsFromNovelUrl(dom, novelUrl, chapterUrlsUI);
+        }
+
+        // Keep the established TOC behaviour for a novel's home page.
+        if (dom.querySelector("ul#idData")) {
+            return super.getChapterUrls(dom, chapterUrlsUI);
+        }
+
+        return [];
+    }
+
+    async getChapterUrlsFromNovelUrl(dom, novelUrl, chapterUrlsUI) {
+        let tocDom = this.getTocDomFromChapterPage(dom, novelUrl);
+        if (tocDom == null) {
+            tocDom = (await HttpClient.wrapFetch(novelUrl)).responseXML;
+        }
+        let currentUrl = this.normalizeChapterUrlForCompare(dom.baseURI);
+        let firstTocPageChapters = this.removeDuplicateChapterUrls(
+            util.hyperlinksToChapterList(tocDom.querySelector("ul#idData"))
+        );
+        let currentChapterIndex = this.findChapterIndex(firstTocPageChapters, currentUrl);
+        let firstRequiredPage = this.getTocPageIndex(tocDom);
+        let totalPage = this.getTotalTocPages(tocDom);
+        let chapters;
+
+        if (currentChapterIndex >= 0) {
+            chapters = firstTocPageChapters.slice(currentChapterIndex);
+        } else {
+            firstRequiredPage = this.estimateTocPageForChapter(
+                dom.baseURI, firstTocPageChapters.length, firstRequiredPage, totalPage
+            );
+            if (firstRequiredPage == null) {
+                throw new Error(`Unable to locate FreeWebNovel chapter in its table of contents: ${dom.baseURI}`);
+            }
+
+            await this.rateLimitDelay();
+            let firstRequiredDom = await this.fetchTocPage(novelUrl, firstRequiredPage);
+            chapters = this.removeDuplicateChapterUrls(util.hyperlinksToChapterList(firstRequiredDom));
+            currentChapterIndex = this.findChapterIndex(chapters, currentUrl);
+            if (currentChapterIndex < 0) {
+                throw new Error(`FreeWebNovel chapter is missing from TOC page ${firstRequiredPage}: ${dom.baseURI}`);
+            }
+            chapters = chapters.slice(currentChapterIndex);
+        }
+
+        if (chapters.length > 0 && chapterUrlsUI) {
+            chapterUrlsUI.showTocProgress(chapters);
+        }
+        for (let page = firstRequiredPage + 1; page <= totalPage; ++page) {
+            await this.rateLimitDelay();
+            let partialDom = await this.fetchTocPage(novelUrl, page);
+            let partialChapters = this.removeDuplicateChapterUrls(
+                util.hyperlinksToChapterList(partialDom), chapters
+            );
+            if (partialChapters.length === 0) {
+                throw new Error(`FreeWebNovel TOC page ${page} contains no chapters.`);
+            }
+            if (chapterUrlsUI) {
+                chapterUrlsUI.showTocProgress(partialChapters);
+            }
+            chapters = chapters.concat(partialChapters);
+        }
+
+        return chapters;
+    }
+
+    findChapterIndex(chapters, currentUrl) {
+        return chapters.findIndex(chapter =>
+            this.normalizeChapterUrlForCompare(chapter.sourceUrl) === currentUrl
+        );
+    }
+
+    getTocPageIndex(dom) {
+        let selectedOption = dom.querySelector("#indexselect option:checked");
+        let selectedPage = parseInt(selectedOption?.value);
+        if (isNaN(selectedPage)) {
+            selectedPage = parseInt(selectedOption?.textContent);
+        }
+        return (selectedPage > 0) ? selectedPage : 1;
+    }
+
+    estimateTocPageForChapter(chapterUrl, chaptersPerPage, selectedPage, totalPage) {
+        if (selectedPage > 1) {
+            return selectedPage;
+        }
+        let match = /\/chapter-(\d+)(?:[-/]|$)/.exec(new URL(chapterUrl).pathname);
+        if (match == null || chaptersPerPage === 0) {
+            return null;
+        }
+        return Math.min(Math.ceil(parseInt(match[1]) / chaptersPerPage), totalPage);
+    }
+
+    getTocDomFromChapterPage(dom, novelUrl) {
+        let chapterMenu = dom.querySelector("ul#idData");
+        if (chapterMenu?.querySelector("a[href]") == null) {
+            return null;
+        }
+
+        // Desktop reader pages include a TOC fragment. Its relative AJAX URLs
+        // must be resolved against the novel page, not the current chapter.
+        let tocDom = dom.cloneNode(true);
+        util.setBaseTag(novelUrl, tocDom);
+        return tocDom;
+    }
+
+    getNovelUrlFromChapterUrl(chapterUrl) {
+        let url = new URL(chapterUrl);
+        let chapterPath = url.pathname.replace(/\/$/, "");
+        let lastPathSeparator = chapterPath.lastIndexOf("/");
+        let pageName = chapterPath.substring(lastPathSeparator + 1);
+        if (!pageName.startsWith("chapter-")) {
+            return null;
+        }
+        url.pathname = chapterPath.substring(0, lastPathSeparator);
+        url.search = "";
+        url.hash = "";
+        return url.href;
+    }
+
+    normalizeChapterUrlForCompare(chapterUrl) {
+        let url = new URL(chapterUrl);
+        url.search = "";
+        url.hash = "";
+        return util.normalizeUrlForCompare(url.href);
+    }
+
     removeUnwantedElementsFromContentElement(content) {
         // Some watermarks are wrapped in sub elements. Keep genuine subscripts.
         for (let sub of content.querySelectorAll("p sub")) {
